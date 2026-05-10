@@ -1,18 +1,29 @@
-import os
 import io
+import os
+import tempfile
 import traceback
-import numpy as np
+import warnings
+
 import librosa
 import librosa.effects
 import librosa.feature
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import numpy as np
+import soundfile as sf
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import soundfile as sf
-import warnings
+
+from model_runtime import (
+    ARTIFACT_PATH,
+    build_model_vector,
+    load_model_artifact,
+    severity_from_probability,
+    train_and_save_model,
+)
+
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Parkinson's Voice Analysis API", version="1.0.0")
+app = FastAPI(title="Parkinson's Voice Analysis API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,6 +33,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MODEL_ARTIFACT = load_model_artifact()
+
+
+def load_uploaded_audio(contents: bytes, filename: str | None):
+    audio_bytes = io.BytesIO(contents)
+
+    try:
+        audio_bytes.seek(0)
+        y, sr = sf.read(audio_bytes)
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        return y.astype(np.float32), sr
+    except Exception:
+        suffix = os.path.splitext(filename or "")[1] or ".webm"
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+                tmp_file.write(contents)
+                temp_path = tmp_file.name
+            y, sr = librosa.load(temp_path, sr=22050, mono=True)
+            return y.astype(np.float32), sr
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+
 def extract_voice_features(y: np.ndarray, sr: int) -> dict:
     features = {}
 
@@ -29,13 +66,12 @@ def extract_voice_features(y: np.ndarray, sr: int) -> dict:
         y = librosa.resample(y, orig_sr=sr, target_sr=22050)
         sr = 22050
 
-    # F0 via pyin with fallback to yin
     try:
         f0, voiced_flag, _ = librosa.pyin(
             y,
-            fmin=float(librosa.note_to_hz('C2')),
-            fmax=float(librosa.note_to_hz('C7')),
-            sr=sr
+            fmin=float(librosa.note_to_hz("C2")),
+            fmax=float(librosa.note_to_hz("C7")),
+            sr=sr,
         )
         mask = voiced_flag & ~np.isnan(f0)
         f0_voiced = f0[mask]
@@ -45,53 +81,53 @@ def extract_voice_features(y: np.ndarray, sr: int) -> dict:
     if len(f0_voiced) < 5:
         try:
             f0_yin = librosa.yin(y, fmin=50, fmax=500, sr=sr)
-            f0_voiced = f0_yin[f0_yin > 50]
+            f0_voiced = f0_yin[np.isfinite(f0_yin) & (f0_yin > 50)]
         except Exception:
             f0_voiced = np.array([])
 
     if len(f0_voiced) < 5:
         raise ValueError(
-            "Not enough voiced audio detected. "
-            "Please record at least 5+ seconds of natural speech in a quiet room."
+            "Not enough voiced audio detected. Please record at least 5 seconds of clear speech in a quiet room."
         )
 
-    features["MDVP_Fo_Hz"]  = float(np.mean(f0_voiced))
+    features["MDVP_Fo_Hz"] = float(np.mean(f0_voiced))
     features["MDVP_Fhi_Hz"] = float(np.max(f0_voiced))
     features["MDVP_Flo_Hz"] = float(np.min(f0_voiced))
 
     f0_diffs = np.abs(np.diff(f0_voiced))
-    mean_f0  = float(np.mean(f0_voiced)) + 1e-10
+    mean_f0 = float(np.mean(f0_voiced)) + 1e-10
     features["MDVP_Jitter_pct"] = float(np.mean(f0_diffs) / mean_f0 * 100)
     features["MDVP_Jitter_Abs"] = float(np.mean(f0_diffs))
-    features["MDVP_RAP"]        = float(np.mean(np.abs(np.diff(f0_voiced))) / mean_f0)
-    features["MDVP_PPQ"]        = float(np.mean(np.abs(f0_voiced - np.roll(f0_voiced, 1))) / mean_f0)
-    features["Jitter_DDP"]      = features["MDVP_RAP"] * 3
+    features["MDVP_RAP"] = float(np.mean(np.abs(np.diff(f0_voiced))) / mean_f0)
+    features["MDVP_PPQ"] = float(np.mean(np.abs(f0_voiced - np.roll(f0_voiced, 1))) / mean_f0)
+    features["Jitter_DDP"] = features["MDVP_RAP"] * 3
 
-    rms         = librosa.feature.rms(y=y, frame_length=512, hop_length=128)[0]
+    rms = librosa.feature.rms(y=y, frame_length=512, hop_length=128)[0]
     rms_nonzero = rms[rms > 1e-8]
     if len(rms_nonzero) < 2:
         rms_nonzero = rms + 1e-8
-    amp_diffs = np.abs(np.diff(rms_nonzero))
-    mean_rms  = float(np.mean(rms_nonzero)) + 1e-10
-    features["MDVP_Shimmer"]    = float(np.mean(amp_diffs) / mean_rms)
-    features["MDVP_Shimmer_dB"] = float(20 * np.log10(1 + features["MDVP_Shimmer"] + 1e-10))
-    features["Shimmer_APQ3"]    = features["MDVP_Shimmer"]
-    features["Shimmer_APQ5"]    = features["MDVP_Shimmer"] * 1.1
-    features["MDVP_APQ"]        = features["MDVP_Shimmer"] * 1.2
-    features["Shimmer_DDA"]     = features["MDVP_Shimmer"] * 3
 
-    harmonic    = librosa.effects.harmonic(y)
-    noise       = y - harmonic
-    hnr_power   = float(np.mean(harmonic ** 2)) + 1e-10
-    noise_power = float(np.mean(noise ** 2))    + 1e-10
+    amp_diffs = np.abs(np.diff(rms_nonzero))
+    mean_rms = float(np.mean(rms_nonzero)) + 1e-10
+    features["MDVP_Shimmer"] = float(np.mean(amp_diffs) / mean_rms)
+    features["MDVP_Shimmer_dB"] = float(20 * np.log10(1 + features["MDVP_Shimmer"] + 1e-10))
+    features["Shimmer_APQ3"] = features["MDVP_Shimmer"]
+    features["Shimmer_APQ5"] = features["MDVP_Shimmer"] * 1.1
+    features["MDVP_APQ"] = features["MDVP_Shimmer"] * 1.2
+    features["Shimmer_DDA"] = features["MDVP_Shimmer"] * 3
+
+    harmonic = librosa.effects.harmonic(y)
+    noise = y - harmonic
+    hnr_power = float(np.mean(harmonic**2)) + 1e-10
+    noise_power = float(np.mean(noise**2)) + 1e-10
     features["NHR"] = noise_power / hnr_power
     features["HNR"] = float(10 * np.log10(hnr_power / noise_power))
 
     seg = y[:2000] if len(y) >= 2000 else y
-    autocorr      = np.correlate(seg, seg, mode='full')
-    autocorr      = autocorr[autocorr.size // 2:]
+    autocorr = np.correlate(seg, seg, mode="full")
+    autocorr = autocorr[autocorr.size // 2 :]
     autocorr_norm = autocorr / (autocorr[0] + 1e-10)
-    lag           = min(100, len(autocorr_norm))
+    lag = min(100, len(autocorr_norm))
     features["RPDE"] = float(np.std(autocorr_norm[:lag]))
 
     cumsum = np.cumsum(y - np.mean(y))
@@ -101,9 +137,9 @@ def extract_voice_features(y: np.ndarray, sr: int) -> dict:
     features["spread1"] = float(-np.mean(spec_bw))
     features["spread2"] = float(np.std(spec_bw))
 
-    nbins = min(20, len(f0_voiced))
+    nbins = max(2, min(20, len(f0_voiced)))
     hist, _ = np.histogram(f0_voiced, bins=nbins, density=True)
-    hist    = hist + 1e-10
+    hist = hist + 1e-10
     features["PPE"] = float(-np.sum(hist * np.log(hist)) / (np.log(nbins) + 1e-10))
 
     features["D2"] = float(np.log(np.std(y) + 1e-10) / np.log(len(y) + 1))
@@ -111,145 +147,99 @@ def extract_voice_features(y: np.ndarray, sr: int) -> dict:
     return features
 
 
-SEVERITY_LEVELS = {
-    0: {
-        "label": "No Parkinson's Detected",
-        "color": "#00C896",
-        "description": "Voice biomarkers are within normal range. No signs of Parkinson's disease detected.",
-        "recommendation": "Continue routine health monitoring. Consult a neurologist if you notice tremors or motor difficulties."
-    },
-    1: {
-        "label": "Early Stage (HY Stage 1)",
-        "color": "#FFD166",
-        "description": "Mild vocal irregularities detected. May indicate very early-stage Parkinson's (HY Stage 1) — unilateral symptoms.",
-        "recommendation": "Consult a neurologist soon. Early intervention significantly improves outcomes."
-    },
-    2: {
-        "label": "Moderate Stage (HY Stage 2-3)",
-        "color": "#FF9F43",
-        "description": "Moderate voice perturbations detected, consistent with mid-stage Parkinson's (HY Stage 2-3).",
-        "recommendation": "Seek immediate neurological evaluation. Treatment and therapy can meaningfully slow progression."
-    },
-    3: {
-        "label": "Advanced Stage (HY Stage 4-5)",
-        "color": "#EE4B6A",
-        "description": "Significant dysphonia detected, consistent with advanced Parkinson's (HY Stage 4-5).",
-        "recommendation": "Urgent neurological care recommended. Multidisciplinary treatment team advised."
-    }
-}
-
-
 def classify_voice(features: dict) -> dict:
-    score = 0
-    jitter   = features.get("MDVP_Jitter_pct", 0)
-    shimmer  = features.get("MDVP_Shimmer", 0)
-    hnr      = features.get("HNR", 20)
-    nhr      = features.get("NHR", 0)
-    ppe      = features.get("PPE", 0)
-    rpde     = features.get("RPDE", 0)
-    dda      = features.get("Shimmer_DDA", 0)
-    f0_range = features.get("MDVP_Fhi_Hz", 200) - features.get("MDVP_Flo_Hz", 100)
+    vector = build_model_vector(features, MODEL_ARTIFACT["feature_mapping"])
+    probability = float(MODEL_ARTIFACT["model"].predict_proba(vector)[0, 1])
+    has_parkinsons = bool(probability >= 0.5)
+    severity = severity_from_probability(probability)
+    confidence = round(max(probability, 1 - probability) * 100, 1)
 
-    if jitter > 2.5:     score += 3
-    elif jitter > 1.5:   score += 2
-    elif jitter > 1.0:   score += 1
-
-    if shimmer > 0.10:   score += 3
-    elif shimmer > 0.06: score += 2
-    elif shimmer > 0.04: score += 1
-
-    if hnr < 10:    score += 3
-    elif hnr < 14:  score += 2
-    elif hnr < 18:  score += 1
-
-    if nhr > 0.15:   score += 3
-    elif nhr > 0.08: score += 2
-    elif nhr > 0.04: score += 1
-
-    if ppe > 0.45:   score += 2
-    elif ppe > 0.30: score += 1
-
-    if rpde > 0.6:    score += 2
-    elif rpde > 0.45: score += 1
-
-    if f0_range < 20:  score += 2
-    elif f0_range < 40: score += 1
-
-    if dda > 0.30:   score += 2
-    elif dda > 0.15: score += 1
-
-    max_score  = 21
-    confidence = round(min(score / max_score, 1.0) * 100, 1)
-
-    if score <= 3:    severity = 0
-    elif score <= 8:  severity = 1
-    elif score <= 14: severity = 2
-    else:             severity = 3
+    f0_range = features["MDVP_Fhi_Hz"] - features["MDVP_Flo_Hz"]
 
     return {
-        "has_parkinsons": severity > 0,
+        "has_parkinsons": has_parkinsons,
         "severity": severity,
-        "severity_info": SEVERITY_LEVELS[severity],
+        "severity_info": MODEL_ARTIFACT["risk_bands"][severity],
         "confidence": confidence,
-        "raw_score": score,
-        "max_score": max_score,
-        "features": {k: round(float(v), 6) for k, v in features.items()},
+        "raw_score": round(probability * 100, 1),
+        "max_score": 100,
+        "model": {
+            "name": MODEL_ARTIFACT["model_name"],
+            "probability": round(probability, 4),
+            "artifact_path": str(ARTIFACT_PATH.name),
+            "metrics": MODEL_ARTIFACT["metrics"],
+        },
+        "features": {key: round(float(value), 6) for key, value in features.items()},
         "key_indicators": {
-            "jitter_pct":  round(jitter, 4),
-            "shimmer":     round(shimmer, 4),
-            "hnr_db":      round(hnr, 2),
-            "nhr":         round(nhr, 4),
-            "ppe":         round(ppe, 4),
+            "jitter_pct": round(features["MDVP_Jitter_pct"], 4),
+            "shimmer": round(features["MDVP_Shimmer"], 4),
+            "hnr_db": round(features["HNR"], 2),
+            "nhr": round(features["NHR"], 4),
+            "ppe": round(features["PPE"], 4),
             "f0_range_hz": round(f0_range, 2),
-        }
+        },
     }
 
 
 @app.get("/")
 def root():
-    return {"message": "Parkinson's Voice Analysis API", "status": "running"}
+    return {
+        "message": "Parkinson's Voice Analysis API",
+        "status": "running",
+        "model": MODEL_ARTIFACT["model_name"],
+    }
+
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "model_loaded": True,
+        "model_name": MODEL_ARTIFACT["model_name"],
+        "metrics": MODEL_ARTIFACT["metrics"],
+    }
+
+
+@app.post("/retrain")
+def retrain_model():
+    global MODEL_ARTIFACT
+    MODEL_ARTIFACT = train_and_save_model(force=True)
+    return {
+        "status": "retrained",
+        "model_name": MODEL_ARTIFACT["model_name"],
+        "metrics": MODEL_ARTIFACT["metrics"],
+    }
+
 
 @app.post("/analyze")
 async def analyze_voice(file: UploadFile = File(...)):
     contents = await file.read()
     if len(contents) < 500:
-        raise HTTPException(status_code=400, detail="File too small — no audio detected.")
-
-    audio_bytes = io.BytesIO(contents)
+        raise HTTPException(status_code=400, detail="File too small - no audio detected.")
 
     try:
-        try:
-            audio_bytes.seek(0)
-            y, sr = sf.read(audio_bytes)
-            if y.ndim > 1:
-                y = y.mean(axis=1)
-            y = y.astype(np.float32)
-        except Exception:
-            audio_bytes.seek(0)
-            y, sr = librosa.load(audio_bytes, sr=22050, mono=True)
+        y, sr = load_uploaded_audio(contents, file.filename)
 
         if len(y) < sr * 2:
             raise HTTPException(
                 status_code=422,
-                detail="Recording too short. Please record at least 5 seconds of natural speech."
+                detail="Recording too short. Please record at least 5 seconds of natural speech.",
             )
 
         features = extract_voice_features(y, sr)
-        result   = classify_voice(features)
+        result = classify_voice(features)
         return JSONResponse(content=result)
 
     except HTTPException:
         raise
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
         print("TRACEBACK:\n", traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Analysis error: {exc}")
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
