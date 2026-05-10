@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 
-const API_URL = "http://localhost:8000";
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 // ─── Color palette ─────────────────────────────────────────────────────────
 const COLORS = {
@@ -148,7 +148,7 @@ function FeatureBar({ label, value, max, unit, warn }) {
 
 // ─── Severity Badge ──────────────────────────────────────────────────────────
 function SeverityBadge({ level }) {
-  const labels = ["None", "Early (HY 1)", "Moderate (HY 2-3)", "Advanced (HY 4-5)"];
+  const labels = ["Low", "Mild", "Elevated", "High"];
   const color = SEVERITY_COLOR[level];
   return (
     <span style={{
@@ -173,6 +173,50 @@ function RecordTimer({ seconds }) {
   );
 }
 
+function mergeBuffers(chunks, totalLength) {
+  const merged = new Float32Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
+function encodeWav(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (offset, value) => {
+    for (let i = 0; i < value.length; i += 1) {
+      view.setUint8(offset + i, value.charCodeAt(i));
+    }
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    offset += 2;
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 // ─── Main App ────────────────────────────────────────────────────────────────
 export default function App() {
   const [status, setStatus] = useState("idle"); // idle | recording | analyzing | done | error
@@ -181,10 +225,12 @@ export default function App() {
   const [seconds, setSeconds] = useState(0);
   const [audioBlob, setAudioBlob] = useState(null);
 
-  const mediaRecorderRef = useRef(null);
   const analyserRef = useRef(null);
   const audioCtxRef = useRef(null);
-  const chunksRef = useRef([]);
+  const pcmChunksRef = useRef([]);
+  const sampleRateRef = useRef(44100);
+  const processorRef = useRef(null);
+  const sourceRef = useRef(null);
   const timerRef = useRef(null);
   const streamRef = useRef(null);
 
@@ -208,22 +254,24 @@ export default function App() {
 
       // Web Audio for visualiser
       audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      sampleRateRef.current = audioCtxRef.current.sampleRate;
       const source = audioCtxRef.current.createMediaStreamSource(stream);
+      sourceRef.current = source;
       const analyser = audioCtxRef.current.createAnalyser();
       analyser.fftSize = 2048;
       source.connect(analyser);
       analyserRef.current = analyser;
 
-      chunksRef.current = [];
-      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
-      mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      mr.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-        setAudioBlob(blob);
-        analyseBlob(blob);
+      const processor = audioCtxRef.current.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+      pcmChunksRef.current = [];
+      processor.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        pcmChunksRef.current.push(new Float32Array(input));
       };
-      mr.start(100);
-      mediaRecorderRef.current = mr;
+
+      source.connect(processor);
+      processor.connect(audioCtxRef.current.destination);
       setStatus("recording");
     } catch (e) {
       setError("Microphone access denied. Please allow microphone permissions and try again.");
@@ -232,12 +280,19 @@ export default function App() {
   }, []);
 
   const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && status === "recording") {
-      mediaRecorderRef.current.stop();
+    if (status === "recording") {
+      const totalLength = pcmChunksRef.current.reduce((sum, chunk) => sum + chunk.length, 0);
+      const merged = mergeBuffers(pcmChunksRef.current, totalLength);
+      const blob = encodeWav(merged, sampleRateRef.current);
+
+      processorRef.current?.disconnect();
+      sourceRef.current?.disconnect();
       streamRef.current?.getTracks().forEach(t => t.stop());
       audioCtxRef.current?.close();
       analyserRef.current = null;
+      setAudioBlob(blob);
       setStatus("analyzing");
+      analyseBlob(blob);
     }
   }, [status]);
 
@@ -245,11 +300,17 @@ export default function App() {
     try {
       setStatus("analyzing");
       const formData = new FormData();
-      formData.append("file", blob, "recording.webm");
+      formData.append("file", blob, "recording.wav");
       const res = await fetch(`${API_URL}/analyze`, { method: "POST", body: formData });
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || "Analysis failed");
+        let message = "Analysis failed";
+        try {
+          const err = await res.json();
+          message = err.detail || err.message || message;
+        } catch {
+          message = await res.text() || message;
+        }
+        throw new Error(message);
       }
       const data = await res.json();
       setResult(data);
@@ -321,7 +382,7 @@ export default function App() {
           </h1>
           <p style={{ color: COLORS.muted, fontSize: "14px", maxWidth: "560px", margin: "0 auto", lineHeight: 1.7 }}>
             Speak naturally — say your name, today's date, or read a sentence aloud.
-            Our system analyzes 22 vocal biomarkers from your natural speech to screen for Parkinson's disease indicators.
+            Our system analyzes 22 vocal biomarkers from your natural speech and runs them through a trained Parkinson's voice classifier.
           </p>
           <div style={{
             display: "inline-block", marginTop: "12px",
@@ -520,20 +581,20 @@ export default function App() {
               </div>
             </div>
 
-            {/* HY Stage visual */}
+            {/* Risk band visual */}
             <div style={{
               background: COLORS.card, border: `1px solid ${COLORS.border}`,
               borderRadius: "14px", padding: "24px", marginTop: "20px"
             }}>
               <div style={{ fontSize: "11px", color: COLORS.muted, letterSpacing: "0.1em", marginBottom: "18px" }}>
-                HOEHN & YAHR SCALE REFERENCE
+                MODEL RISK BANDS
               </div>
               <div style={{ display: "flex", gap: "0", position: "relative" }}>
                 {[
-                  { label: "No PD", sub: "Normal", color: COLORS.green },
-                  { label: "HY 1", sub: "Unilateral", color: COLORS.yellow },
-                  { label: "HY 2-3", sub: "Bilateral", color: COLORS.orange },
-                  { label: "HY 4-5", sub: "Severe", color: COLORS.red },
+                  { label: "Low", sub: "<35%", color: COLORS.green },
+                  { label: "Mild", sub: "35-55%", color: COLORS.yellow },
+                  { label: "Elevated", sub: "55-75%", color: COLORS.orange },
+                  { label: "High", sub: "75%+", color: COLORS.red },
                 ].map((s, i) => (
                   <div key={i} style={{
                     flex: 1, textAlign: "center", padding: "14px 8px",
@@ -560,7 +621,7 @@ export default function App() {
 
         {/* Footer */}
         <div style={{ marginTop: "48px", textAlign: "center", color: COLORS.muted, fontSize: "11px", lineHeight: 1.8 }}>
-          <div>Built for clinical screening research. Uses MDVP-equivalent feature extraction + rule-based classifier.</div>
+          <div>Built for screening research. Uses MDVP-equivalent feature extraction plus a trained classifier based on the Oxford Parkinson's dataset.</div>
           <div>⚠ Not a substitute for professional medical evaluation.</div>
         </div>
 

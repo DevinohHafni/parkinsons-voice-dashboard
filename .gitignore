@@ -1,0 +1,9 @@
+.DS_Store
+Thumbs.db
+
+backend/.venv/
+backend/__pycache__/
+*.pyc
+
+frontend/dist/
+frontend/node_modules/.vite/
